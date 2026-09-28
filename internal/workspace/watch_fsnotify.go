@@ -23,7 +23,15 @@ type fsnotifyWatcher struct {
 	onFullReconcile  func()
 	onCoverageChange func(bool)
 	add              func(string) error
+	remove           func(string) error
 	wg               sync.WaitGroup
+
+	// tops are the nested worktrees found so far. Only a top itself is watched,
+	// for its .git file. pending holds tops whose .git file went away; the retry
+	// tick checks them, after git worktree remove has had time to finish. Only
+	// the loop goroutine uses pending.
+	tops    worktreeTops
+	pending map[string]struct{}
 
 	mu     sync.Mutex
 	failed map[string]struct{}
@@ -60,6 +68,7 @@ func startFSNotifyWatcher(root string, callbacks WatchCallbacks) (watchBackend, 
 		onChange:        callbacks.PathChanged,
 		onFullReconcile: callbacks.FullReconcile,
 		add:             fsw.Add,
+		remove:          fsw.Remove,
 		failed:          make(map[string]struct{}),
 	}
 	if watched := w.watchTree(root); watched == 0 {
@@ -92,33 +101,97 @@ func (w *fsnotifyWatcher) watchTree(root string) int {
 }
 
 func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
+	if info, err := os.Lstat(root); err != nil || !info.IsDir() || skipWatchDir(info.Name()) {
+		return 0
+	}
 	watched := 0
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() {
+	var walk func(dir string)
+	walk = func(dir string) {
+		if dir != root || includeRoot {
+			if addErr := w.add(dir); addErr != nil {
+				w.setFailed(dir, true)
+				log.Printf("Warning: cannot watch %s: %v", dir, addErr)
+			} else {
+				w.setFailed(dir, false)
+				watched++
+			}
+		}
+		entries, err := readDirUnsorted(dir)
+		if err != nil {
+			return
+		}
+		// The entries show a nested worktree without another syscall. Its top
+		// stays watched, so that a change to its .git file is seen.
+		if dir != w.root && parser.HasLinkedWorktreeGitFile(dir, entries) {
+			w.tops.add(dir)
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() && !skipWatchDir(e.Name()) {
+				walk(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	walk(root)
+	return watched
+}
+
+// readDirUnsorted lists a directory without the sort that os.ReadDir does.
+func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return f.ReadDir(-1)
+}
+
+// unwatchBelow drops the watches below dir, which turned out to be a nested
+// worktree after it was watched, and forgets their failures so the retry timer
+// does not add them back.
+func (w *fsnotifyWatcher) unwatchBelow(dir string) {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() || path == dir {
 			return nil
 		}
 		if skipWatchDir(d.Name()) {
 			return filepath.SkipDir
 		}
-		if path != w.root && parser.IsLinkedWorktree(path) {
-			return filepath.SkipDir
-		}
-		if path == root && !includeRoot {
-			return nil
-		}
-		if addErr := w.add(path); addErr != nil {
-			w.setFailed(path, true)
-			log.Printf("Warning: cannot watch %s: %v", path, addErr)
-			return nil
+		if w.remove != nil {
+			_ = w.remove(path)
 		}
 		w.setFailed(path, false)
-		watched++
 		return nil
 	})
-	if walkErr != nil {
-		log.Printf("Warning: walking %s to add watches: %v", root, walkErr)
+}
+
+// checkPending handles tops whose .git file went away. A top that is gone, or
+// is a worktree again, needs nothing. A top that is now a plain directory is
+// watched and indexed like any new directory.
+func (w *fsnotifyWatcher) checkPending() {
+	for dir := range w.pending {
+		delete(w.pending, dir)
+		info, err := os.Stat(dir)
+		if err == nil && info.IsDir() && parser.IsLinkedWorktree(dir) {
+			continue
+		}
+		w.tops.remove(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		w.watchTree(dir)
+		_ = parser.WalkElixirFiles(dir, func(file string, _ fs.DirEntry) error {
+			w.onChange(file)
+			return nil
+		})
 	}
-	return watched
+}
+
+func (w *fsnotifyWatcher) markPending(dir string) {
+	if w.pending == nil {
+		w.pending = make(map[string]struct{})
+	}
+	w.pending[dir] = struct{}{}
 }
 
 // setFailed emits only coverage edges. The callback runs without mu held because
@@ -160,7 +233,7 @@ func (w *fsnotifyWatcher) retryFailedUnder(root string) {
 func (w *fsnotifyWatcher) retryPaths(paths []string) {
 	for _, path := range paths {
 		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
+		if err != nil || !info.IsDir() || w.tops.under(w.root, path) {
 			w.setFailed(path, false)
 			continue
 		}
@@ -190,27 +263,53 @@ func (w *fsnotifyWatcher) loop() {
 				return
 			}
 			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				// Lost events can hide a top that went away or became plain.
+				for _, dir := range w.tops.list() {
+					w.markPending(dir)
+				}
 				w.onFullReconcile()
 				continue
 			}
 			log.Printf("Warning: workspace watcher: %v", err)
 		case <-ticker.C:
 			w.retryFailed()
+			w.checkPending()
 		}
 	}
 }
 
 func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 	path := ev.Name
+	base := filepath.Base(path)
+	dir := filepath.Dir(path)
+	gone := ev.Op.Has(fsnotify.Remove) || ev.Op.Has(fsnotify.Rename)
+
+	// A nested worktree top is watched only for its .git file. Nothing was
+	// indexed from it, so its own removal needs no work either.
+	if w.tops.has(dir) {
+		if base == ".git" && gone {
+			w.markPending(dir)
+		}
+		return
+	}
+	if gone && w.tops.has(path) {
+		w.tops.remove(path)
+		delete(w.pending, path)
+		return
+	}
+
 	if ev.Op.Has(fsnotify.Create) {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			if skipWatchDir(filepath.Base(path)) {
+			if skipWatchDir(base) {
 				return
 			}
 			if added := w.watchTree(path); added == 0 {
 				log.Printf("Warning: no directory under %s could be watched", path)
 			}
 			w.retryFailedUnder(path)
+			if w.tops.has(path) {
+				return
+			}
 			_ = parser.WalkElixirFiles(path, func(file string, _ fs.DirEntry) error {
 				w.onChange(file)
 				return nil
@@ -219,9 +318,19 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 		}
 	}
 
-	base := filepath.Base(path)
+	if base == ".git" {
+		// git worktree add creates the directory before its .git file, and cp -r
+		// can copy subdirectories first, so a tree can be watched before it
+		// turns out to be a worktree. Anything indexed from it before then is
+		// removed when the runtime is told about the directory.
+		if dir != w.root && ev.Op.Has(fsnotify.Create) && parser.IsLinkedWorktree(dir) && w.tops.add(dir) {
+			w.unwatchBelow(dir)
+			w.onChange(dir)
+		}
+		return
+	}
 	manifest := base == "mix.lock" || base == "mix.exs"
-	if parser.IsElixirFile(path) || manifest || ev.Op.Has(fsnotify.Remove) || ev.Op.Has(fsnotify.Rename) {
+	if parser.IsElixirFile(path) || manifest || gone {
 		// Ignore events from explicitly skipped subtrees that can still be
 		// delivered for a watched parent during directory replacement.
 		rel, err := filepath.Rel(w.root, path)

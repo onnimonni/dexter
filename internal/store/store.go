@@ -819,6 +819,30 @@ func (s *Store) ListFilePaths() ([]string, error) {
 	return paths, rows.Err()
 }
 
+// ListFilePathsUnder returns the indexed files below the directory dir. Like
+// HasPath, it reads only the matching range of the unique path index instead of
+// every stored path.
+func (s *Store) ListFilePathsUnder(dir string) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT path FROM files WHERE path >= ? AND path < ?",
+		dir+string(os.PathSeparator), dir+string(rune(os.PathSeparator+1)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
 // HasPath reports whether path is an indexed file or a directory holding one.
 // The range on the unique path index finds a descendant without listing every
 // file: sep+1 is the first byte after the separator, so [prefix, upper) spans

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -2996,6 +2997,111 @@ func TestWalkAndCollectSkipNestedLinkedWorktrees(t *testing.T) {
 	}
 	if InLinkedWorktree(root, filepath.Join(base, "elsewhere/lib/a.ex")) {
 		t.Error("InLinkedWorktree matched a path outside the root")
+	}
+}
+
+// TestLinkedWorktreeDetection uses git's own marker, the commondir file in a
+// worktree's admin directory, so worktrees of bare repositories count and a
+// submodule checked out at a path named worktrees/ does not.
+func TestLinkedWorktreeDetection(t *testing.T) {
+	base := t.TempDir()
+	write := func(rel, content string) string {
+		t.Helper()
+		path := filepath.Join(base, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// A worktree of a bare repository.
+	write("repo.git/worktrees/bare_wt/commondir", "../..\n")
+	write("app/bare_wt/.git", "gitdir: "+filepath.Join(base, "repo.git/worktrees/bare_wt")+"\n")
+	// A worktree whose admin directory git has pruned.
+	write("app/pruned/.git", "gitdir: "+filepath.Join(base, "app/.git/worktrees/pruned")+"\n")
+	// A submodule at worktrees/lib: its admin directory has no commondir.
+	write("app/.git/modules/worktrees/lib/HEAD", "ref: refs/heads/main\n")
+	write("app/worktrees/lib/.git", "gitdir: ../../.git/modules/worktrees/lib\n")
+
+	for dir, want := range map[string]bool{
+		"app/bare_wt":       true,
+		"app/pruned":        true,
+		"app/worktrees/lib": false,
+		"app":               false,
+	} {
+		if got := IsLinkedWorktree(filepath.Join(base, dir)); got != want {
+			t.Errorf("IsLinkedWorktree(%s) = %v, want %v", dir, got, want)
+		}
+	}
+
+	for dir, want := range map[string]string{
+		"app":               filepath.Join(base, "app/.git"),
+		"app/bare_wt":       filepath.Join(base, "repo.git/worktrees/bare_wt"),
+		"app/worktrees/lib": filepath.Join(base, "app/.git/modules/worktrees/lib"),
+	} {
+		if got, ok := GitDir(filepath.Join(base, dir)); !ok || got != want {
+			t.Errorf("GitDir(%s) = %q, %v; want %q", dir, got, ok, want)
+		}
+	}
+	if _, ok := GitDir(filepath.Join(base, "repo.git")); ok {
+		t.Error("GitDir found a checkout in a bare repository's directory")
+	}
+}
+
+// TestLinkedWorktreeDetectionWithGit checks the detection against the .git
+// files that git itself writes: absolute and relative worktrees, a worktree of a
+// bare repository, and a submodule.
+func TestLinkedWorktreeDetectionWithGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	base := t.TempDir()
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always"}, args...)...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	lib := filepath.Join(base, "shared_lib")
+	app := filepath.Join(base, "app")
+	for _, dir := range []string{lib, app} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		git(dir, "init", "-q")
+		git(dir, "commit", "-q", "--allow-empty", "-m", "init")
+	}
+	git(app, "submodule", "add", "-q", lib, "vendor/shared_lib")
+	git(app, "commit", "-qm", "submodule")
+	git(app, "worktree", "add", "-q", ".claude/worktrees/abs")
+	git(app, "-c", "worktree.useRelativePaths=true", "worktree", "add", "-q", "wt_rel")
+	git(base, "clone", "-q", "--bare", app, "bare.git")
+	git(filepath.Join(base, "bare.git"), "worktree", "add", "-q", filepath.Join(app, "from_bare"))
+
+	for dir, want := range map[string]bool{
+		".claude/worktrees/abs": true,
+		"wt_rel":                true,
+		"from_bare":             true,
+		"vendor/shared_lib":     false,
+	} {
+		if got := IsLinkedWorktree(filepath.Join(app, dir)); got != want {
+			t.Errorf("IsLinkedWorktree(%s) = %v, want %v", dir, got, want)
+		}
+	}
+	for _, dir := range []string{".", "wt_rel", "from_bare", "vendor/shared_lib"} {
+		gitDir, ok := GitDir(filepath.Join(app, dir))
+		if !ok {
+			t.Errorf("GitDir(%s) found nothing", dir)
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(gitDir, "HEAD")); err != nil {
+			t.Errorf("GitDir(%s) = %s, which has no HEAD", dir, gitDir)
+		}
 	}
 }
 

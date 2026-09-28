@@ -362,7 +362,8 @@ func (s *Server) warmUsingCache() {
 	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
 }
 
-// pruneMissingFiles removes stored files that the sweep did not see on disk.
+// pruneMissingFiles removes stored files that the sweep did not see on disk, and
+// stored files inside a nested worktree, which the sweep skips.
 //
 // It holds indexWrites for writing, so no single-file write can land between
 // the decision and the delete, and it re-checks each candidate against the
@@ -389,12 +390,29 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	}
 
 	var toRemove []string
+	// Files in a nested worktree exist, but no walk yields them, and indexes
+	// built before worktrees were skipped still hold them. The answer is the
+	// same for every file in a directory, so it is looked up once per directory,
+	// and only for the few paths the sweep did not see.
+	inWorktree := make(map[string]bool)
 	for _, storedPath := range storedPaths {
 		if _, ok := seen[storedPath]; ok {
 			continue
 		}
-		if _, err := os.Lstat(storedPath); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		_, err := os.Lstat(storedPath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			continue
+		}
+		if err == nil {
+			dir := filepath.Dir(storedPath)
+			in, ok := inWorktree[dir]
+			if !ok {
+				in = parser.InLinkedWorktree(s.projectRoot, storedPath)
+				inWorktree[dir] = in
+			}
+			if !in {
+				continue
+			}
 		}
 		toRemove = append(toRemove, storedPath)
 	}
@@ -680,16 +698,9 @@ func (s *Server) RemoveFilesUnderRoot(root string) {
 	if root == "" {
 		return
 	}
-	stored, err := s.store.ListFilePaths()
+	paths, err := s.store.ListFilePathsUnder(filepath.Clean(root))
 	if err != nil {
 		return
-	}
-	prefix := filepath.Clean(root) + string(os.PathSeparator)
-	paths := make([]string, 0)
-	for _, path := range stored {
-		if strings.HasPrefix(filepath.Clean(path), prefix) {
-			paths = append(paths, path)
-		}
 	}
 	s.RemoveFiles(paths)
 }
@@ -697,7 +708,13 @@ func (s *Server) RemoveFilesUnderRoot(root string) {
 // watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
 func (s *Server) watchGitHead() {
 	go func() {
-		headPath := filepath.Join(s.projectRoot, ".git", "HEAD")
+		// In a linked worktree or a submodule, .git is a file that names the
+		// git directory, and HEAD is there.
+		gitDir, ok := parser.GitDir(s.projectRoot)
+		if !ok {
+			return
+		}
+		headPath := filepath.Join(gitDir, "HEAD")
 		var lastMtime int64
 
 		info, err := os.Stat(headPath)

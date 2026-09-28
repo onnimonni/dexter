@@ -186,7 +186,7 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		if err != nil {
 			return nil
 		}
-		if !isRoot && hasLinkedWorktreeGitFile(dir, entries) {
+		if !isRoot && HasLinkedWorktreeGitFile(dir, entries) {
 			return nil
 		}
 		for _, e := range entries {
@@ -222,7 +222,7 @@ func skipDir(name string) bool {
 // Claude Code's .claude/worktrees/) is a full copy of the repository, and
 // indexing it would duplicate every definition. Scanning the entries already
 // read costs no syscall; only a directory that has a .git file pays one read.
-func hasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
+func HasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
 	for _, e := range entries {
 		if e.Name() == ".git" {
 			return !e.IsDir() && isLinkedWorktreeGitFile(filepath.Join(dir, ".git"))
@@ -231,24 +231,63 @@ func hasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
 	return false
 }
 
-// isLinkedWorktreeGitFile reports whether the .git file at path points into
-// another repository's .git/worktrees/. Submodules also have a .git file, but
-// it points into .git/modules/, and they stay indexed like any other directory.
+// isLinkedWorktreeGitFile reports whether the .git file at path belongs to a
+// linked worktree. Submodules also have a .git file, and they stay indexed like
+// any other directory. Only a directory that has a .git file pays for this check.
 func isLinkedWorktreeGitFile(path string) bool {
+	gitdir, ok := gitdirFromFile(path)
+	if !ok {
+		return false
+	}
+	// Git gives each linked worktree an admin directory with a commondir file,
+	// and a submodule's has none. This also covers worktrees of bare
+	// repositories. After git prunes the admin directory, only its place under
+	// <common dir>/worktrees/ is left to go by.
+	if _, err := os.Stat(filepath.Join(gitdir, "commondir")); err == nil {
+		return true
+	}
+	if _, err := os.Stat(gitdir); err == nil {
+		return false
+	}
+	return filepath.Base(filepath.Dir(gitdir)) == "worktrees"
+}
+
+// gitdirFromFile returns the git directory that the .git file at path names,
+// resolved against the file's directory. It reports false when path is not such
+// a file, which includes a .git directory.
+func gitdirFromFile(path string) (string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return "", false
 	}
 	var buf [4096]byte
 	n, _ := f.Read(buf[:])
 	_ = f.Close()
 	line, _, _ := strings.Cut(string(buf[:n]), "\n")
 	gitdir, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
-	if !ok {
-		return false
+	gitdir = strings.TrimSpace(gitdir)
+	if !ok || gitdir == "" {
+		return "", false
 	}
-	gitdir = filepath.ToSlash(filepath.Clean(strings.TrimSpace(gitdir)))
-	return strings.Contains(gitdir, "/.git/worktrees/") || strings.HasPrefix(gitdir, ".git/worktrees/")
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(filepath.Dir(path), gitdir)
+	}
+	return filepath.Clean(gitdir), true
+}
+
+// GitDir returns the git directory of the checkout at dir: dir/.git when that
+// is a directory, or the directory a .git file names in a linked worktree or a
+// submodule.
+func GitDir(dir string) (string, bool) {
+	path := filepath.Join(dir, ".git")
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	if info.IsDir() {
+		return path, true
+	}
+	return gitdirFromFile(path)
 }
 
 // IsLinkedWorktree reports whether dir is the top of a linked git worktree.
@@ -313,7 +352,7 @@ func CollectElixirFilesParallel(root string) []string {
 		if err != nil {
 			return
 		}
-		if dir != root && hasLinkedWorktreeGitFile(dir, entries) {
+		if dir != root && HasLinkedWorktreeGitFile(dir, entries) {
 			return
 		}
 
