@@ -484,47 +484,6 @@ func TestWatcherStartsWithRecordedWorktreeAsTop(t *testing.T) {
 	}
 }
 
-// A known top can outlive its directory: git's record of a deleted worktree
-// is loaded at start, or the top's parent is moved away. A plain directory
-// made at that path later is indexed, not skipped for the watcher's life.
-func TestWatcherForgetsStaleTops(t *testing.T) {
-	root := t.TempDir()
-	stub := &watchAddStub{failing: map[string]bool{}}
-	w, changed, _ := newRecordingWatcher(root, stub)
-
-	stale := filepath.Join(root, ".claude", "worktrees", "deleted")
-	w.tops.add(stale)
-	file := filepath.Join(stale, "lib", "plain.ex")
-	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(file, []byte("defmodule Plain do\nend\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	w.handle(fsnotify.Event{Name: stale, Op: fsnotify.Create})
-	w.checkPending()
-	if !slices.Equal(*changed, []string{file}) || w.tops.has(stale) {
-		t.Errorf("reported %v, tops = %v; want %s reported and no tops", *changed, w.tops.list(), file)
-	}
-	if !slices.Contains(stub.paths(), filepath.Join(stale, "lib")) {
-		t.Error("the plain directory's subdirectories are not watched")
-	}
-
-	parent := filepath.Join(root, "area")
-	inside := filepath.Join(parent, "wt")
-	w.tops.add(inside)
-	if err := os.MkdirAll(inside, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(parent, filepath.Join(root, "area.old")); err != nil {
-		t.Fatal(err)
-	}
-	w.handle(fsnotify.Event{Name: parent, Op: fsnotify.Rename})
-	if w.tops.has(inside) {
-		t.Error("a top below a moved directory is still known")
-	}
-}
-
 func TestNestedWorktreeTopsReadsGitRecords(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, ".claude", "worktrees", "feature")

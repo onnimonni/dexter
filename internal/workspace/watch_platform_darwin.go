@@ -136,20 +136,10 @@ func (w *fseventsWatcher) handle(event fsevents.Event) {
 	if flags&fsevents.ItemIsDir != 0 {
 		if w.tops.has(path) {
 			// Nothing was indexed from a top, so its removal needs no reconcile.
-			// A known top that is back as a plain directory, such as one made
-			// where a recorded worktree was deleted, is checked again later.
 			if _, err := os.Stat(path); err != nil {
 				w.tops.remove(path)
-			} else if !parser.IsLinkedWorktree(path) {
-				w.checkTopLater(path)
 			}
 			return
-		}
-		// A directory that went away or moved takes the tops below it along.
-		if flags&(fsevents.ItemRemoved|fsevents.ItemRenamed) != 0 {
-			if _, err := os.Stat(path); err != nil {
-				w.tops.removeBelow(path)
-			}
 		}
 		// A worktree moved or copied into place is a top from now on. The
 		// runtime is told once, as for a new .git file, to drop anything

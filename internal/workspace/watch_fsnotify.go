@@ -123,13 +123,8 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 				watched++
 			}
 		}
-		// A top stays watched, so that a change to its .git file is seen. A
-		// known top that is not a worktree on disk, such as a plain directory
-		// made where a recorded worktree was deleted, is checked again later.
+		// A top stays watched, so that a change to its .git file is seen.
 		if dir != w.root && w.tops.has(dir) {
-			if !parser.IsLinkedWorktree(dir) {
-				w.markPending(dir)
-			}
 			return
 		}
 		entries, err := parser.ReadDirUnsorted(dir)
@@ -313,12 +308,6 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 		w.tops.remove(path)
 		delete(w.pending, path)
 		return
-	}
-	// A directory that went away or moved takes the tops below it along.
-	if gone {
-		for _, top := range w.tops.removeBelow(path) {
-			delete(w.pending, top)
-		}
 	}
 	// Events from deeper inside a top can still be queued from before it
 	// turned out to be a worktree.
