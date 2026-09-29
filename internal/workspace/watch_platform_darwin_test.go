@@ -118,14 +118,15 @@ func TestFSEventsIgnoresNestedWorktree(t *testing.T) {
 	w.handle(fsevents.Event{Path: filepath.Join(known, "lib", "copy.ex"), Flags: fsevents.ItemIsFile | fsevents.ItemModified})
 	w.handle(fsevents.Event{Path: filepath.Join(known, "mix.exs"), Flags: fsevents.ItemIsFile | fsevents.ItemModified})
 	w.handle(fsevents.Event{Path: filepath.Join(known, "lib", "copy.ex"), Flags: fsevents.ItemIsFile | fsevents.ItemRemoved})
-	// Not known yet: the disk check still keeps its directories out.
-	w.handle(fsevents.Event{Path: fresh, Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
-	w.handle(fsevents.Event{Path: filepath.Join(fresh, "lib"), Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
 	if full != 0 || len(paths) != 0 {
 		t.Fatalf("full reconciliations = %d, paths = %v; want none", full, paths)
 	}
 
-	// Its .git file makes fresh a known top, and the runtime is told once.
+	// Not known yet, but its .git file is on disk when the directory's event
+	// is handled: fresh becomes a known top, and the runtime is told once,
+	// however its directory and .git events arrive.
+	w.handle(fsevents.Event{Path: fresh, Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
+	w.handle(fsevents.Event{Path: filepath.Join(fresh, "lib"), Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
 	w.handle(fsevents.Event{Path: filepath.Join(fresh, ".git"), Flags: fsevents.ItemIsFile | fsevents.ItemCreated})
 	w.handle(fsevents.Event{Path: filepath.Join(fresh, ".git"), Flags: fsevents.ItemIsFile | fsevents.ItemModified})
 	if !w.tops.has(fresh) || len(paths) != 1 || paths[0] != fresh {
@@ -148,7 +149,63 @@ func TestFSEventsIgnoresNestedWorktree(t *testing.T) {
 	}
 }
 
-// A top whose .git file goes away is indexed once it is a plain directory.
+// A worktree renamed within the project is a known top under its new name.
+func TestFSEventsKnowsRenamedTop(t *testing.T) {
+	root := t.TempDir()
+	moved := filepath.Join(root, ".claude", "worktrees", "moved")
+	makeLinkedWorktree(t, root, moved)
+	var paths []string
+	full := 0
+	w := &fseventsWatcher{
+		root:      root,
+		eventRoot: root,
+		callbacks: WatchCallbacks{PathChanged: func(path string) { paths = append(paths, path) }, FullReconcile: func() { full++ }},
+	}
+	old := filepath.Join(root, ".claude", "worktrees", "old")
+	w.tops.add(old)
+	w.handle(fsevents.Event{Path: old, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	w.handle(fsevents.Event{Path: moved, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	w.handle(fsevents.Event{Path: filepath.Join(moved, "lib", "copy.ex"), Flags: fsevents.ItemIsFile | fsevents.ItemModified})
+	if w.tops.has(old) || !w.tops.has(moved) {
+		t.Errorf("tops = %v, want only %s", w.tops.list(), moved)
+	}
+	if full != 0 || !slices.Equal(paths, []string{moved}) {
+		t.Errorf("full reconciliations = %d, paths = %v; want none and %s once", full, paths, moved)
+	}
+}
+
+// A top whose .git file goes away stays a top while git records it, as during
+// git worktree remove.
+func TestFSEventsKeepsRecordedTop(t *testing.T) {
+	previous := watchRetryInterval
+	watchRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() { watchRetryInterval = previous })
+
+	root := t.TempDir()
+	wt := filepath.Join(root, "wt")
+	makeLinkedWorktree(t, root, wt)
+	changes := make(chan string, 8)
+	w := &fseventsWatcher{
+		root:      root,
+		eventRoot: root,
+		callbacks: WatchCallbacks{PathChanged: func(path string) { changes <- path }, FullReconcile: func() {}},
+	}
+	w.tops.add(wt)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsevents.Event{Path: filepath.Join(wt, ".git"), Flags: fsevents.ItemIsFile | fsevents.ItemRemoved})
+	select {
+	case path := <-changes:
+		t.Fatalf("reported %s from a worktree that git still records", path)
+	case <-time.After(20 * watchRetryInterval):
+	}
+	if !w.tops.has(wt) {
+		t.Error("a worktree that git still records is no longer a top")
+	}
+}
+
+// A top whose .git file and git record go away is indexed as a plain directory.
 func TestFSEventsIndexesTopThatBecomesPlain(t *testing.T) {
 	previous := watchRetryInterval
 	watchRetryInterval = 10 * time.Millisecond
@@ -157,6 +214,9 @@ func TestFSEventsIndexesTopThatBecomesPlain(t *testing.T) {
 	root := t.TempDir()
 	wt := filepath.Join(root, "wt")
 	makeLinkedWorktree(t, root, wt)
+	if err := os.RemoveAll(filepath.Join(root, ".git", "worktrees", "wt")); err != nil {
+		t.Fatal(err)
+	}
 	changes := make(chan string, 8)
 	w := &fseventsWatcher{
 		root:      root,

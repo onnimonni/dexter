@@ -3105,6 +3105,123 @@ func TestLinkedWorktreeDetectionWithGit(t *testing.T) {
 	}
 }
 
+// gitRepoWithNestedWorktree makes a committed repository at base/app with a
+// linked worktree at .claude/worktrees/feature, both with one Elixir file.
+func gitRepoWithNestedWorktree(t *testing.T) (app, wt string, git func(args ...string)) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	app = filepath.Join(t.TempDir(), "app")
+	git = func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+		cmd.Dir = app
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(app, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "lib", "app.ex"), []byte("defmodule App do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("init", "-q")
+	git("add", ".")
+	git("commit", "-qm", "init")
+	wt = filepath.Join(app, ".claude", "worktrees", "feature")
+	git("worktree", "add", "-q", wt)
+	return app, wt, git
+}
+
+func walkedAndCollected(t *testing.T, root string) ([]string, []string) {
+	t.Helper()
+	var walked []string
+	if err := WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+		walked = append(walked, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	collected := CollectElixirFilesParallel(root)
+	sort.Strings(walked)
+	sort.Strings(collected)
+	return walked, collected
+}
+
+// git worktree remove, like rm -r, can delete a worktree's .git file before the
+// rest of its checkout, and git's record of it last. A walk in between must
+// still skip the worktree; once git no longer records it, it is a plain
+// directory and is indexed.
+func TestWalkAndCollectSkipWorktreeBeingRemoved(t *testing.T) {
+	app, wt, git := gitRepoWithNestedWorktree(t)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(app, "lib", "app.ex")}
+	walked, collected := walkedAndCollected(t, app)
+	if !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("while git records the worktree: Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+
+	git("worktree", "prune")
+	want = append(want, filepath.Join(wt, "lib", "app.ex"))
+	sort.Strings(want)
+	walked, collected = walkedAndCollected(t, app)
+	if !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("after git worktree prune: Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+}
+
+// git worktree add writes the admin directory's gitdir file, then the .git
+// file, then commondir. A watcher that reads the .git file in between must
+// still see a worktree.
+func TestLinkedWorktreeDetectedBeforeCommondir(t *testing.T) {
+	app, wt, _ := gitRepoWithNestedWorktree(t)
+	if err := os.Remove(filepath.Join(app, ".git", "worktrees", "feature", "commondir")); err != nil {
+		t.Fatal(err)
+	}
+	if !IsLinkedWorktree(wt) {
+		t.Error("IsLinkedWorktree missed a worktree whose commondir is not written yet")
+	}
+}
+
+// git records a worktree's path with symlinks resolved. A root spelled
+// through a symlink must still find it, in the root's spelling.
+func TestNestedWorktreeTopsThroughSymlinkedRoot(t *testing.T) {
+	app, _, _ := gitRepoWithNestedWorktree(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(app, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	want := []string{filepath.Join(link, ".claude", "worktrees", "feature")}
+	if got := NestedWorktreeTops(link); !reflect.DeepEqual(got, want) {
+		t.Errorf("NestedWorktreeTops(link) = %v, want %v", got, want)
+	}
+}
+
+// A root that is a file is yielded by both walkers.
+func TestWalkAndCollectAgreeOnFileRoot(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "one.ex")
+	if err := os.WriteFile(file, []byte("defmodule One do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	walked, collected := walkedAndCollected(t, file)
+	if want := []string{file}; !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+	other := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(other, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if walked, collected := walkedAndCollected(t, other); len(walked) != 0 || len(collected) != 0 {
+		t.Errorf("non-Elixir file root: Walk = %v, Collect = %v", walked, collected)
+	}
+}
+
 // TestParse_AliasOverExistingAlias covers alias chaining on alias lines:
 // `alias SharedLib.Accounts` then `alias Accounts.Users` must record the
 // canonical SharedLib.Accounts.Users, not the literal "Accounts.Users".

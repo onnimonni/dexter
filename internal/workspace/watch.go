@@ -1,8 +1,8 @@
 package workspace
 
 import (
-	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -122,46 +122,11 @@ func (s *worktreeTops) under(root, path string) bool {
 	return false
 }
 
-// nestedWorktreeTops lists the linked worktrees of root's repository that are
-// checked out below root. It reads git's own records: each admin directory in
-// <common dir>/worktrees/ has a gitdir file that names the worktree's .git
-// file. Paths come back in the spelling of root; aliases are other spellings of
-// root, such as its symlink-resolved path, that git may have recorded instead.
-func nestedWorktreeTops(root string, aliases ...string) []string {
-	gitDir, ok := parser.GitDir(root)
-	if !ok {
-		return nil
-	}
-	common := gitDir
-	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
-		common = resolveFrom(gitDir, strings.TrimSpace(string(b)))
-	}
-	admins, err := os.ReadDir(filepath.Join(common, "worktrees"))
-	if err != nil {
-		return nil
-	}
-	var tops []string
-	for _, admin := range admins {
-		adminDir := filepath.Join(common, "worktrees", admin.Name())
-		b, err := os.ReadFile(filepath.Join(adminDir, "gitdir"))
-		if err != nil {
-			continue
-		}
-		top := filepath.Dir(resolveFrom(adminDir, strings.TrimSpace(string(b))))
-		for _, spelling := range append([]string{root}, aliases...) {
-			rel, err := filepath.Rel(spelling, top)
-			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				tops = append(tops, filepath.Join(root, rel))
-				break
-			}
-		}
-	}
-	return tops
-}
-
-func resolveFrom(dir, path string) string {
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(dir, path)
-	}
-	return filepath.Clean(path)
+// stillWorktree reports whether dir, a known nested worktree top, still is one:
+// its .git file links a worktree, or git still records it, as it does while git
+// worktree remove deletes the checkout. The walkers skip both, so the watchers
+// must not index either. It reads git's records, so it is only for the rare
+// check of a top whose .git file went away.
+func stillWorktree(root, dir string) bool {
+	return parser.IsLinkedWorktree(dir) || slices.Contains(parser.NestedWorktreeTops(root), dir)
 }

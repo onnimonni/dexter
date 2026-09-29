@@ -393,8 +393,10 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	// Files in a nested worktree exist, but no walk yields them, and indexes
 	// built before worktrees were skipped still hold them. The answer is the
 	// same for every file in a directory, so it is looked up once per directory,
-	// and only for the few paths the sweep did not see.
+	// and only for the few paths the sweep did not see. The walk also skips
+	// worktrees that git records after their .git file is gone.
 	inWorktree := make(map[string]bool)
+	var recorded map[string]struct{}
 	for _, storedPath := range storedPaths {
 		if _, ok := seen[storedPath]; ok {
 			continue
@@ -407,7 +409,13 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 			dir := filepath.Dir(storedPath)
 			in, ok := inWorktree[dir]
 			if !ok {
-				in = parser.InLinkedWorktree(s.projectRoot, storedPath)
+				if recorded == nil {
+					recorded = make(map[string]struct{})
+					for _, top := range parser.NestedWorktreeTops(s.projectRoot) {
+						recorded[top] = struct{}{}
+					}
+				}
+				in = underTop(s.projectRoot, dir, recorded) || parser.InLinkedWorktree(s.projectRoot, storedPath)
 				inWorktree[dir] = in
 			}
 			if !in {
@@ -419,6 +427,20 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	if len(toRemove) > 0 {
 		_ = s.store.RemoveFiles(toRemove)
 	}
+}
+
+// underTop reports whether dir is one of tops or lies below one, not counting
+// root itself.
+func underTop(root, dir string, tops map[string]struct{}) bool {
+	if len(tops) == 0 {
+		return false
+	}
+	for ; len(dir) > len(root); dir = filepath.Dir(dir) {
+		if _, ok := tops[dir]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // showError reports a problem the user has to act on. The caller logs as well,

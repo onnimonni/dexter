@@ -313,19 +313,22 @@ func TestWatcherDropsWatchesWhenDirectoryBecomesWorktree(t *testing.T) {
 	}
 }
 
-// A top whose .git file went away is checked later. If it is gone or a worktree
-// again, nothing happens; if it is now a plain directory, it is watched and
-// indexed.
+// A top whose .git file went away is checked later. If it is gone, a worktree
+// again, or still recorded by git, as during git worktree remove, nothing
+// happens; if it is now a plain directory, it is watched and indexed.
 func TestWatcherChecksTopsThatLostTheirGitFile(t *testing.T) {
 	root := t.TempDir()
 	plain := filepath.Join(root, "became_plain")
 	again := filepath.Join(root, "worktree_again")
 	gone := filepath.Join(root, "gone")
-	for _, dir := range []string{plain, again, gone} {
+	removing := filepath.Join(root, "being_removed")
+	for _, dir := range []string{plain, again, gone, removing} {
 		makeLinkedWorktree(t, root, dir)
 	}
-	if err := os.Remove(filepath.Join(plain, ".git")); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{filepath.Join(plain, ".git"), filepath.Join(root, ".git", "worktrees", "became_plain"), filepath.Join(removing, ".git")} {
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.RemoveAll(gone); err != nil {
 		t.Fatal(err)
@@ -333,7 +336,7 @@ func TestWatcherChecksTopsThatLostTheirGitFile(t *testing.T) {
 
 	stub := &watchAddStub{failing: map[string]bool{}}
 	w, changed, _ := newRecordingWatcher(root, stub)
-	for _, dir := range []string{plain, again, gone} {
+	for _, dir := range []string{plain, again, gone, removing} {
 		w.tops.add(dir)
 		w.markPending(dir)
 	}
@@ -348,8 +351,10 @@ func TestWatcherChecksTopsThatLostTheirGitFile(t *testing.T) {
 	if want := []string{filepath.Join(plain, "lib", "copy.ex"), filepath.Join(plain, "top_level.ex")}; !slices.Equal(*changed, want) {
 		t.Errorf("reported %v, want %v", *changed, want)
 	}
-	if tops := w.tops.list(); !slices.Equal(tops, []string{again}) {
-		t.Errorf("tops = %v, want [%s]", tops, again)
+	tops := w.tops.list()
+	slices.Sort(tops)
+	if want := []string{removing, again}; !slices.Equal(tops, want) {
+		t.Errorf("tops = %v, want %v", tops, want)
 	}
 	if len(w.pending) != 0 {
 		t.Errorf("pending = %v after the check", w.pending)
@@ -384,6 +389,62 @@ func TestWatcherDoesNotRetryFailedDirectoryInNestedWorktree(t *testing.T) {
 	}
 }
 
+// The Create event of a new .git file can be read before git writes the file.
+// Its Write event makes the directory a top then.
+func TestWatcherFindsWorktreeFromGitFileWrite(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	makeLinkedWorktree(t, root, wt)
+	gitFile := filepath.Join(wt, ".git")
+	content, err := os.ReadFile(gitFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gitFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stub := &watchAddStub{failing: map[string]bool{}}
+	w, changed, _ := newRecordingWatcher(root, stub)
+
+	w.handle(fsnotify.Event{Name: gitFile, Op: fsnotify.Create})
+	if w.tops.has(wt) {
+		t.Fatal("an empty .git file made a top")
+	}
+	if err := os.WriteFile(gitFile, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsnotify.Event{Name: gitFile, Op: fsnotify.Write})
+	if !w.tops.has(wt) || !slices.Equal(*changed, []string{wt}) {
+		t.Errorf("tops = %v, reported %v; want %s known and reported once", w.tops.list(), *changed, wt)
+	}
+}
+
+// A worktree that git records but whose .git file is gone is a top from the
+// start, as the walkers skip it: its subdirectories are not watched.
+func TestWatcherStartsWithRecordedWorktreeAsTop(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	makeLinkedWorktree(t, root, wt)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	backend, err := startFSNotifyWatcher(root, WatchCallbacks{PathChanged: func(string) {}, FullReconcile: func() {}, CoverageChanged: func(bool) {}})
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	w := backend.(*fsnotifyWatcher)
+	t.Cleanup(func() { _ = w.Close() })
+	watched := w.fsw.WatchList()
+	for _, path := range watched {
+		if strings.HasPrefix(path, wt+string(filepath.Separator)) {
+			t.Errorf("watching %s inside a recorded worktree", path)
+		}
+	}
+	if !slices.Contains(watched, wt) || !w.tops.has(wt) {
+		t.Errorf("the recorded worktree's top is not a watched top: tops = %v", w.tops.list())
+	}
+}
+
 func TestNestedWorktreeTopsReadsGitRecords(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, ".claude", "worktrees", "feature")
@@ -391,15 +452,15 @@ func TestNestedWorktreeTopsReadsGitRecords(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "sibling")
 	makeLinkedWorktree(t, root, outside)
 
-	if got := nestedWorktreeTops(root); !slices.Equal(got, []string{inside}) {
+	if got := parser.NestedWorktreeTops(root); !slices.Equal(got, []string{inside}) {
 		t.Errorf("nestedWorktreeTops = %v, want [%s]", got, inside)
 	}
 	// From inside a linked worktree, commondir leads to the same records.
-	if got := nestedWorktreeTops(inside); len(got) != 0 {
-		t.Errorf("nestedWorktreeTops(worktree) = %v, want none below it", got)
+	if got := parser.NestedWorktreeTops(inside); len(got) != 0 {
+		t.Errorf("NestedWorktreeTops(worktree) = %v, want none below it", got)
 	}
-	if got := nestedWorktreeTops(t.TempDir()); len(got) != 0 {
-		t.Errorf("nestedWorktreeTops(no repo) = %v", got)
+	if got := parser.NestedWorktreeTops(t.TempDir()); len(got) != 0 {
+		t.Errorf("NestedWorktreeTops(no repo) = %v", got)
 	}
 }
 
@@ -479,6 +540,32 @@ func TestFSNotifyWatcherSkipsWorktreeAddedWhileRunning(t *testing.T) {
 		wt := filepath.Join(env.root, ".claude", "worktrees", "feature")
 		env.git("worktree", "add", "-q", wt)
 		env.settle(t)
+		if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		env.settle(t)
+		time.Sleep(5 * watchRetryInterval)
+		env.settle(t)
+		// git still records the worktree, as it does during git worktree
+		// remove, so it stays out like it does for the walkers.
+		for _, path := range env.changedPaths() {
+			if strings.HasPrefix(path, wt+string(filepath.Separator)) && parser.IsElixirFile(path) {
+				t.Errorf("reported %s from a worktree that git still records", path)
+			}
+		}
+		if !env.w.tops.has(wt) {
+			t.Error("a worktree that git still records is no longer a top")
+		}
+	})
+
+	t.Run("delete the .git file and git's record", func(t *testing.T) {
+		env := newWatchedRepo(t)
+		wt := filepath.Join(env.root, ".claude", "worktrees", "feature")
+		env.git("worktree", "add", "-q", wt)
+		env.settle(t)
+		if err := os.RemoveAll(filepath.Join(env.root, ".git", "worktrees", "feature")); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
 			t.Fatal(err)
 		}

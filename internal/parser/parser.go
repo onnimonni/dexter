@@ -158,7 +158,9 @@ func IsElixirFile(path string) bool {
 
 // WalkElixirFiles walks root, skipping _build/.git/node_modules directories and
 // linked git worktrees nested below root, and calls fn for each .ex/.exs file
-// found.
+// found. A nested worktree is a directory with a linked-worktree .git file, or
+// one that git still records as a worktree of root's repository (see
+// NestedWorktreeTops).
 //
 // A root that is itself a symlink to a directory is followed; symlinks below it
 // are not. This has to match CollectElixirFilesParallel exactly, because the
@@ -180,8 +182,12 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		return fn(root, fs.FileInfoToDirEntry(info))
 	}
 
+	recorded := nestedWorktreeSet(root)
 	var walk func(dir string, isRoot bool) error
 	walk = func(dir string, isRoot bool) error {
+		if _, ok := recorded[dir]; ok && !isRoot {
+			return nil
+		}
 		entries, err := readDirUnsorted(dir)
 		if err != nil {
 			return nil
@@ -246,6 +252,17 @@ func isLinkedWorktreeGitFile(path string) bool {
 	if _, err := os.Stat(filepath.Join(gitdir, "commondir")); err == nil {
 		return true
 	}
+	// git worktree add writes the admin directory's gitdir file, then the .git
+	// file, then commondir, so a watcher can read the .git file before commondir
+	// exists. The gitdir file naming this .git file back identifies the worktree
+	// then; a submodule's git directory has no gitdir file.
+	if b, err := os.ReadFile(filepath.Join(gitdir, "gitdir")); err == nil {
+		back, backErr := os.Stat(resolveFrom(gitdir, strings.TrimSpace(string(b))))
+		self, selfErr := os.Stat(path)
+		if backErr == nil && selfErr == nil && os.SameFile(back, self) {
+			return true
+		}
+	}
 	if _, err := os.Stat(gitdir); err == nil {
 		return false
 	}
@@ -269,10 +286,15 @@ func gitdirFromFile(path string) (string, bool) {
 	if !ok || gitdir == "" {
 		return "", false
 	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(filepath.Dir(path), gitdir)
+	return resolveFrom(filepath.Dir(path), gitdir), true
+}
+
+// resolveFrom resolves path, as a git record writes it, against dir.
+func resolveFrom(dir, path string) string {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
 	}
-	return filepath.Clean(gitdir), true
+	return filepath.Clean(path)
 }
 
 // GitDir returns the git directory of the checkout at dir: dir/.git when that
@@ -314,6 +336,70 @@ func InLinkedWorktree(root, path string) bool {
 	return false
 }
 
+// NestedWorktreeTops lists the linked worktrees of root's repository that are
+// checked out strictly below root. It reads git's own records: each admin
+// directory in <common dir>/worktrees/ has a gitdir file that names the
+// worktree's .git file. Paths come back in the spelling of root; aliases are
+// other spellings of root that git may have recorded instead, and the
+// symlink-resolved one is always tried.
+//
+// A worktree stays listed while git records it, even after its .git file is
+// gone: git worktree remove, like rm -r, can delete the .git file first and the
+// rest of the checkout after it, and a walk in between must not index what is
+// left. git worktree prune drops the record of a checkout without a .git file.
+//
+// A root without a .git entry costs one stat, so walks of subtrees and of
+// directories outside a repository pay almost nothing.
+func NestedWorktreeTops(root string, aliases ...string) []string {
+	gitDir, ok := GitDir(root)
+	if !ok {
+		return nil
+	}
+	common := gitDir
+	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		common = resolveFrom(gitDir, strings.TrimSpace(string(b)))
+	}
+	admins, err := readDirUnsorted(filepath.Join(common, "worktrees"))
+	if err != nil || len(admins) == 0 {
+		return nil
+	}
+	spellings := append([]string{root}, aliases...)
+	if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
+		spellings = append(spellings, resolved)
+	}
+	var tops []string
+	for _, admin := range admins {
+		adminDir := filepath.Join(common, "worktrees", admin.Name())
+		b, err := os.ReadFile(filepath.Join(adminDir, "gitdir"))
+		if err != nil {
+			continue
+		}
+		top := filepath.Dir(resolveFrom(adminDir, strings.TrimSpace(string(b))))
+		for _, spelling := range spellings {
+			rel, err := filepath.Rel(spelling, top)
+			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				tops = append(tops, filepath.Join(root, rel))
+				break
+			}
+		}
+	}
+	return tops
+}
+
+// nestedWorktreeSet is NestedWorktreeTops as a set for the walkers, nil when
+// there are none, so that the common case is a lookup in a nil map.
+func nestedWorktreeSet(root string) map[string]struct{} {
+	tops := NestedWorktreeTops(root)
+	if len(tops) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(tops))
+	for _, top := range tops {
+		set[top] = struct{}{}
+	}
+	return set
+}
+
 // readDirUnsorted lists a directory without sorting the entries. os.ReadDir and
 // filepath.WalkDir both sort every directory they read; the indexer keys rows by
 // path and does not care about order, so the sort is pure cost.
@@ -335,6 +421,14 @@ func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
 // The returned order is unspecified. Callers key rows by path, so traversal
 // order does not affect any query result.
 func CollectElixirFilesParallel(root string) []string {
+	// A root that is a file is yielded alone, as WalkElixirFiles does.
+	if info, err := os.Stat(root); err == nil && !info.IsDir() {
+		if IsElixirFile(root) {
+			return []string{root}
+		}
+		return nil
+	}
+	recorded := nestedWorktreeSet(root)
 	workers := runtime.NumCPU()
 	sem := make(chan struct{}, workers)
 
@@ -348,6 +442,9 @@ func CollectElixirFilesParallel(root string) []string {
 	walk = func(dir string) {
 		defer wg.Done()
 
+		if _, ok := recorded[dir]; ok && dir != root {
+			return
+		}
 		entries, err := readDirUnsorted(dir)
 		if err != nil {
 			return

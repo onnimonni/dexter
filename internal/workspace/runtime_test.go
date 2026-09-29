@@ -250,6 +250,34 @@ func TestReindexRemovesRowsFromNestedWorktree(t *testing.T) {
 	}
 }
 
+// git worktree remove deletes the .git file before the rest of the checkout,
+// and its record last. A sweep in between must drop rows from the worktree, not
+// keep them because the files still exist.
+func TestReindexRemovesRowsFromWorktreeBeingRemoved(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	old := writeTestModule(t, wt, "lib/old.ex", "SharedLib.OldCopy")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), old); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") == 0 {
+		t.Fatal("setup: the worktree file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Reindex(testContext(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") != 0 {
+		t.Fatal("the sweep kept a row from a worktree that git still records")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("the sweep did not index the project")
+	}
+}
+
 // In a linked worktree, .git is a file and HEAD is in the git directory it
 // names. A branch switch there must still reconcile the workspace.
 func TestGitWatchFollowsLinkedWorktreeHead(t *testing.T) {

@@ -72,7 +72,7 @@ func startFSEventsWatcher(root string, callbacks WatchCallbacks) (*fseventsWatch
 		return nil, err
 	}
 	w := &fseventsWatcher{root: absRoot, eventRoot: eventRoot, stream: stream, callbacks: callbacks}
-	for _, dir := range nestedWorktreeTops(absRoot, eventRoot) {
+	for _, dir := range parser.NestedWorktreeTops(absRoot, eventRoot) {
 		w.tops.add(dir)
 	}
 	w.wg.Add(1)
@@ -139,6 +139,15 @@ func (w *fseventsWatcher) handle(event fsevents.Event) {
 			}
 			return
 		}
+		// A worktree moved or copied into place is a top from now on. The
+		// runtime is told once, as for a new .git file, to drop anything
+		// indexed from it; it needs no full reconcile.
+		if flags&(fsevents.ItemCreated|fsevents.ItemRenamed) != 0 && parser.IsLinkedWorktree(path) {
+			if w.tops.add(path) {
+				w.callbacks.PathChanged(path)
+			}
+			return
+		}
 		// Directories inside a nested worktree are outside the index, so
 		// checking one out must not reconcile the whole workspace.
 		if flags&(fsevents.ItemCreated|fsevents.ItemRemoved|fsevents.ItemRenamed) != 0 && !inNestedWorktree(w.root, path) {
@@ -178,14 +187,14 @@ func inNestedWorktree(root, dir string) bool {
 }
 
 // checkTopLater indexes dir as a plain directory if, after the retry interval,
-// it still exists and is no longer a worktree.
+// it still exists and is no longer a worktree, not even in git's records.
 func (w *fseventsWatcher) checkTopLater(dir string) {
 	time.AfterFunc(watchRetryInterval, func() {
 		if w.closed.Load() {
 			return
 		}
 		info, err := os.Stat(dir)
-		if err == nil && info.IsDir() && parser.IsLinkedWorktree(dir) {
+		if err == nil && info.IsDir() && stillWorktree(w.root, dir) {
 			return
 		}
 		w.tops.remove(dir)

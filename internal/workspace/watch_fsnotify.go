@@ -71,6 +71,11 @@ func startFSNotifyWatcher(root string, callbacks WatchCallbacks) (watchBackend, 
 		remove:          fsw.Remove,
 		failed:          make(map[string]struct{}),
 	}
+	// Worktrees that git records but whose .git file is gone are skipped by the
+	// walkers, so they are tops too; the rest are found by the walk below.
+	for _, dir := range parser.NestedWorktreeTops(root) {
+		w.tops.add(dir)
+	}
 	if watched := w.watchTree(root); watched == 0 {
 		log.Printf("Warning: no directory under %s could be watched", root)
 	}
@@ -116,12 +121,15 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 				watched++
 			}
 		}
+		// A top stays watched, so that a change to its .git file is seen.
+		if dir != w.root && w.tops.has(dir) {
+			return
+		}
 		entries, err := readDirUnsorted(dir)
 		if err != nil {
 			return
 		}
-		// The entries show a nested worktree without another syscall. Its top
-		// stays watched, so that a change to its .git file is seen.
+		// The entries show a nested worktree without another syscall.
 		if dir != w.root && parser.HasLinkedWorktreeGitFile(dir, entries) {
 			w.tops.add(dir)
 			return
@@ -166,13 +174,13 @@ func (w *fsnotifyWatcher) unwatchBelow(dir string) {
 }
 
 // checkPending handles tops whose .git file went away. A top that is gone, or
-// is a worktree again, needs nothing. A top that is now a plain directory is
-// watched and indexed like any new directory.
+// is still a worktree to git, needs nothing. A top that is now a plain
+// directory is watched and indexed like any new directory.
 func (w *fsnotifyWatcher) checkPending() {
 	for dir := range w.pending {
 		delete(w.pending, dir)
 		info, err := os.Stat(dir)
-		if err == nil && info.IsDir() && parser.IsLinkedWorktree(dir) {
+		if err == nil && info.IsDir() && stillWorktree(w.root, dir) {
 			continue
 		}
 		w.tops.remove(dir)
@@ -322,8 +330,9 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 		// git worktree add creates the directory before its .git file, and cp -r
 		// can copy subdirectories first, so a tree can be watched before it
 		// turns out to be a worktree. Anything indexed from it before then is
-		// removed when the runtime is told about the directory.
-		if dir != w.root && ev.Op.Has(fsnotify.Create) && parser.IsLinkedWorktree(dir) && w.tops.add(dir) {
+		// removed when the runtime is told about the directory. The file can be
+		// empty when its Create event is read, so its Write is checked as well.
+		if dir != w.root && (ev.Op.Has(fsnotify.Create) || ev.Op.Has(fsnotify.Write)) && parser.IsLinkedWorktree(dir) && w.tops.add(dir) {
 			w.unwatchBelow(dir)
 			w.onChange(dir)
 		}
