@@ -213,6 +213,7 @@ func newRecordingWatcher(root string, stub *watchAddStub) (*fsnotifyWatcher, *[]
 	w.root = root
 	w.onChange = func(path string) { changed = append(changed, path) }
 	w.remove = func(path string) error { removed = append(removed, path); return nil }
+	w.watchList = stub.paths
 	return w, &changed, &removed
 }
 
@@ -298,6 +299,11 @@ func TestWatcherDropsWatchesWhenDirectoryBecomesWorktree(t *testing.T) {
 
 	stub := &watchAddStub{failing: map[string]bool{}}
 	w, changed, removed := newRecordingWatcher(root, stub)
+	// Watched before its .git file appeared.
+	for _, dir := range []string{root, wt, filepath.Join(wt, "lib")} {
+		_ = stub.add(dir)
+	}
+	w.setFailed(filepath.Join(wt, "lib", "deep"), true)
 	w.handle(fsnotify.Event{Name: filepath.Join(wt, ".git"), Op: fsnotify.Create})
 	w.handle(fsnotify.Event{Name: filepath.Join(wt, ".git"), Op: fsnotify.Create})
 	w.handle(fsnotify.Event{Name: filepath.Join(plain, ".git"), Op: fsnotify.Create})
@@ -310,6 +316,24 @@ func TestWatcherDropsWatchesWhenDirectoryBecomesWorktree(t *testing.T) {
 	}
 	if !w.tops.has(wt) || w.tops.has(plain) {
 		t.Errorf("tops = %v, want only %s", w.tops.list(), wt)
+	}
+	if failed := w.failedDirectories(); len(failed) != 0 {
+		t.Errorf("failed directories %v below the new top were kept", failed)
+	}
+
+	// A Create for a directory deeper inside the top can still be queued
+	// from before the top was known. It must not be watched or walked.
+	deep := filepath.Join(wt, "lib", "sub")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "deep.ex"), []byte("defmodule Deep do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsnotify.Event{Name: deep, Op: fsnotify.Create})
+	w.handle(fsnotify.Event{Name: filepath.Join(deep, "deep.ex"), Op: fsnotify.Create})
+	if slices.Contains(stub.paths(), deep) || len(*changed) != 1 {
+		t.Errorf("watched %v, reported %v after events from inside the top", stub.paths(), *changed)
 	}
 }
 
@@ -356,8 +380,23 @@ func TestWatcherChecksTopsThatLostTheirGitFile(t *testing.T) {
 	if want := []string{removing, again}; !slices.Equal(tops, want) {
 		t.Errorf("tops = %v, want %v", tops, want)
 	}
-	if len(w.pending) != 0 {
-		t.Errorf("pending = %v after the check", w.pending)
+	if _, ok := w.pending[removing]; !ok || len(w.pending) != 1 {
+		t.Errorf("pending = %v after the check, want only %s", w.pending, removing)
+	}
+
+	// Once git's record goes, as after git worktree prune, the next check
+	// indexes it.
+	if err := os.RemoveAll(filepath.Join(root, ".git", "worktrees", "being_removed")); err != nil {
+		t.Fatal(err)
+	}
+	*changed = (*changed)[:0]
+	w.checkPending()
+	slices.Sort(*changed)
+	if want := []string{filepath.Join(removing, "lib", "copy.ex"), filepath.Join(removing, "top_level.ex")}; !slices.Equal(*changed, want) {
+		t.Errorf("after the record went: reported %v, want %v", *changed, want)
+	}
+	if w.tops.has(removing) || len(w.pending) != 0 {
+		t.Errorf("after the record went: tops = %v, pending = %v", w.tops.list(), w.pending)
 	}
 }
 

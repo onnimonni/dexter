@@ -182,13 +182,13 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		return fn(root, fs.FileInfoToDirEntry(info))
 	}
 
-	recorded := nestedWorktreeSet(root)
+	recorded := NestedWorktreeSet(root)
 	var walk func(dir string, isRoot bool) error
 	walk = func(dir string, isRoot bool) error {
 		if _, ok := recorded[dir]; ok && !isRoot {
 			return nil
 		}
-		entries, err := readDirUnsorted(dir)
+		entries, err := ReadDirUnsorted(dir)
 		if err != nil {
 			return nil
 		}
@@ -223,7 +223,7 @@ func skipDir(name string) bool {
 	return name == "_build" || name == ".git" || name == "node_modules"
 }
 
-// hasLinkedWorktreeGitFile reports whether dir, whose entries are given, is the
+// HasLinkedWorktreeGitFile reports whether dir, whose entries are given, is the
 // top of a linked git worktree. Such a checkout nested inside the project (e.g.
 // Claude Code's .claude/worktrees/) is a full copy of the repository, and
 // indexing it would duplicate every definition. Scanning the entries already
@@ -266,7 +266,10 @@ func isLinkedWorktreeGitFile(path string) bool {
 	if _, err := os.Stat(gitdir); err == nil {
 		return false
 	}
-	return filepath.Base(filepath.Dir(gitdir)) == "worktrees"
+	// A submodule checked out at worktrees/<name> has its git directory at
+	// .git/modules/worktrees/<name>, which is not a worktree admin directory.
+	parent := filepath.Dir(gitdir)
+	return filepath.Base(parent) == "worktrees" && filepath.Base(filepath.Dir(parent)) != "modules"
 }
 
 // gitdirFromFile returns the git directory that the .git file at path names,
@@ -359,7 +362,7 @@ func NestedWorktreeTops(root string, aliases ...string) []string {
 	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
 		common = resolveFrom(gitDir, strings.TrimSpace(string(b)))
 	}
-	admins, err := readDirUnsorted(filepath.Join(common, "worktrees"))
+	admins, err := ReadDirUnsorted(filepath.Join(common, "worktrees"))
 	if err != nil || len(admins) == 0 {
 		return nil
 	}
@@ -386,9 +389,9 @@ func NestedWorktreeTops(root string, aliases ...string) []string {
 	return tops
 }
 
-// nestedWorktreeSet is NestedWorktreeTops as a set for the walkers, nil when
+// NestedWorktreeSet is NestedWorktreeTops as a set, nil when
 // there are none, so that the common case is a lookup in a nil map.
-func nestedWorktreeSet(root string) map[string]struct{} {
+func NestedWorktreeSet(root string) map[string]struct{} {
 	tops := NestedWorktreeTops(root)
 	if len(tops) == 0 {
 		return nil
@@ -400,10 +403,10 @@ func nestedWorktreeSet(root string) map[string]struct{} {
 	return set
 }
 
-// readDirUnsorted lists a directory without sorting the entries. os.ReadDir and
+// ReadDirUnsorted lists a directory without sorting the entries. os.ReadDir and
 // filepath.WalkDir both sort every directory they read; the indexer keys rows by
 // path and does not care about order, so the sort is pure cost.
-func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
+func ReadDirUnsorted(dir string) ([]fs.DirEntry, error) {
 	f, err := os.Open(dir)
 	if err != nil {
 		return nil, err
@@ -428,7 +431,7 @@ func CollectElixirFilesParallel(root string) []string {
 		}
 		return nil
 	}
-	recorded := nestedWorktreeSet(root)
+	recorded := NestedWorktreeSet(root)
 	workers := runtime.NumCPU()
 	sem := make(chan struct{}, workers)
 
@@ -445,7 +448,7 @@ func CollectElixirFilesParallel(root string) []string {
 		if _, ok := recorded[dir]; ok && dir != root {
 			return
 		}
-		entries, err := readDirUnsorted(dir)
+		entries, err := ReadDirUnsorted(dir)
 		if err != nil {
 			return
 		}

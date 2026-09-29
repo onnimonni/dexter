@@ -24,6 +24,7 @@ type fsnotifyWatcher struct {
 	onCoverageChange func(bool)
 	add              func(string) error
 	remove           func(string) error
+	watchList        func() []string
 	wg               sync.WaitGroup
 
 	// tops are the nested worktrees found so far. Only a top itself is watched,
@@ -69,6 +70,7 @@ func startFSNotifyWatcher(root string, callbacks WatchCallbacks) (watchBackend, 
 		onFullReconcile: callbacks.FullReconcile,
 		add:             fsw.Add,
 		remove:          fsw.Remove,
+		watchList:       fsw.WatchList,
 		failed:          make(map[string]struct{}),
 	}
 	// Worktrees that git records but whose .git file is gone are skipped by the
@@ -125,7 +127,7 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 		if dir != w.root && w.tops.has(dir) {
 			return
 		}
-		entries, err := readDirUnsorted(dir)
+		entries, err := parser.ReadDirUnsorted(dir)
 		if err != nil {
 			return
 		}
@@ -144,44 +146,43 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 	return watched
 }
 
-// readDirUnsorted lists a directory without the sort that os.ReadDir does.
-func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
-	f, err := os.Open(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	return f.ReadDir(-1)
-}
-
 // unwatchBelow drops the watches below dir, which turned out to be a nested
 // worktree after it was watched, and forgets their failures so the retry timer
-// does not add them back.
+// does not add them back. It reads the watch list in memory rather than the
+// tree on disk, which can be a whole checkout.
 func (w *fsnotifyWatcher) unwatchBelow(dir string) {
-	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() || path == dir {
-			return nil
+	prefix := dir + string(filepath.Separator)
+	if w.watchList != nil && w.remove != nil {
+		for _, path := range w.watchList() {
+			if strings.HasPrefix(path, prefix) {
+				_ = w.remove(path)
+			}
 		}
-		if skipWatchDir(d.Name()) {
-			return filepath.SkipDir
+	}
+	for _, path := range w.failedDirectories() {
+		if strings.HasPrefix(path, prefix) {
+			w.setFailed(path, false)
 		}
-		if w.remove != nil {
-			_ = w.remove(path)
-		}
-		w.setFailed(path, false)
-		return nil
-	})
+	}
 }
 
 // checkPending handles tops whose .git file went away. A top that is gone, or
-// is still a worktree to git, needs nothing. A top that is now a plain
+// is a worktree again, needs nothing. A top that git still records is checked
+// again on the next tick, until the record goes. A top that is now a plain
 // directory is watched and indexed like any new directory.
 func (w *fsnotifyWatcher) checkPending() {
+	var recorded []string
 	for dir := range w.pending {
 		delete(w.pending, dir)
 		info, err := os.Stat(dir)
-		if err == nil && info.IsDir() && stillWorktree(w.root, dir) {
-			continue
+		if err == nil && info.IsDir() {
+			if parser.IsLinkedWorktree(dir) {
+				continue
+			}
+			if recordedWorktree(w.root, dir) {
+				recorded = append(recorded, dir)
+				continue
+			}
 		}
 		w.tops.remove(dir)
 		if err != nil || !info.IsDir() {
@@ -192,6 +193,9 @@ func (w *fsnotifyWatcher) checkPending() {
 			w.onChange(file)
 			return nil
 		})
+	}
+	for _, dir := range recorded {
+		w.markPending(dir)
 	}
 }
 
@@ -303,6 +307,11 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 	if gone && w.tops.has(path) {
 		w.tops.remove(path)
 		delete(w.pending, path)
+		return
+	}
+	// Events from deeper inside a top can still be queued from before it
+	// turned out to be a worktree.
+	if w.tops.under(w.root, path) {
 		return
 	}
 

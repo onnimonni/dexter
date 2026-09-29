@@ -397,6 +397,7 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	// worktrees that git records after their .git file is gone.
 	inWorktree := make(map[string]bool)
 	var recorded map[string]struct{}
+	recordedRead := false
 	for _, storedPath := range storedPaths {
 		if _, ok := seen[storedPath]; ok {
 			continue
@@ -409,11 +410,8 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 			dir := filepath.Dir(storedPath)
 			in, ok := inWorktree[dir]
 			if !ok {
-				if recorded == nil {
-					recorded = make(map[string]struct{})
-					for _, top := range parser.NestedWorktreeTops(s.projectRoot) {
-						recorded[top] = struct{}{}
-					}
+				if !recordedRead {
+					recorded, recordedRead = parser.NestedWorktreeSet(s.projectRoot), true
 				}
 				in = underTop(s.projectRoot, dir, recorded) || parser.InLinkedWorktree(s.projectRoot, storedPath)
 				inWorktree[dir] = in
@@ -720,9 +718,16 @@ func (s *Server) RemoveFilesUnderRoot(root string) {
 	if root == "" {
 		return
 	}
-	paths, err := s.store.ListFilePathsUnder(filepath.Clean(root))
+	stored, err := s.store.ListFilePaths()
 	if err != nil {
 		return
+	}
+	prefix := filepath.Clean(root) + string(os.PathSeparator)
+	paths := make([]string, 0)
+	for _, path := range stored {
+		if strings.HasPrefix(filepath.Clean(path), prefix) {
+			paths = append(paths, path)
+		}
 	}
 	s.RemoveFiles(paths)
 }

@@ -3024,12 +3024,15 @@ func TestLinkedWorktreeDetection(t *testing.T) {
 	// A submodule at worktrees/lib: its admin directory has no commondir.
 	write("app/.git/modules/worktrees/lib/HEAD", "ref: refs/heads/main\n")
 	write("app/worktrees/lib/.git", "gitdir: ../../.git/modules/worktrees/lib\n")
+	// A submodule at worktrees/gone whose git directory is missing.
+	write("app/worktrees/gone/.git", "gitdir: ../../.git/modules/worktrees/gone\n")
 
 	for dir, want := range map[string]bool{
-		"app/bare_wt":       true,
-		"app/pruned":        true,
-		"app/worktrees/lib": false,
-		"app":               false,
+		"app/bare_wt":        true,
+		"app/pruned":         true,
+		"app/worktrees/lib":  false,
+		"app/worktrees/gone": false,
+		"app":                false,
 	} {
 		if got := IsLinkedWorktree(filepath.Join(base, dir)); got != want {
 			t.Errorf("IsLinkedWorktree(%s) = %v, want %v", dir, got, want)

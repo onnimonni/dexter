@@ -31,9 +31,11 @@ type fseventsWatcher struct {
 	closed    atomic.Bool
 
 	// tops are the nested worktrees this watcher knows, from git's records at
-	// start and from .git files that appear later. FSEvents watches the whole
-	// tree, so events from inside a top are dropped with map lookups.
-	tops worktreeTops
+	// start and from .git files and directories that appear later. FSEvents
+	// watches the whole tree, so events from inside a top are dropped with map
+	// lookups. checking holds the tops that a checkTopLater timer waits on.
+	tops     worktreeTops
+	checking worktreeTops
 }
 
 var newFSEventsBackend = func(root string, callbacks WatchCallbacks) (watchBackend, error) {
@@ -148,9 +150,7 @@ func (w *fseventsWatcher) handle(event fsevents.Event) {
 			}
 			return
 		}
-		// Directories inside a nested worktree are outside the index, so
-		// checking one out must not reconcile the whole workspace.
-		if flags&(fsevents.ItemCreated|fsevents.ItemRemoved|fsevents.ItemRenamed) != 0 && !inNestedWorktree(w.root, path) {
+		if flags&(fsevents.ItemCreated|fsevents.ItemRemoved|fsevents.ItemRenamed) != 0 {
 			w.callbacks.FullReconcile()
 		}
 		return
@@ -179,23 +179,27 @@ func (w *fseventsWatcher) gitFileChanged(dir string) {
 	}
 }
 
-// inNestedWorktree reports whether dir is, or lies inside, a linked git worktree
-// nested below root. The index leaves those trees out, so their directories need
-// no watch and creating one needs no reconcile.
-func inNestedWorktree(root, dir string) bool {
-	return dir != root && (parser.IsLinkedWorktree(dir) || parser.InLinkedWorktree(root, dir))
-}
-
 // checkTopLater indexes dir as a plain directory if, after the retry interval,
-// it still exists and is no longer a worktree, not even in git's records.
+// it still exists and is no longer a worktree. While git still records it, it
+// is checked again after each interval, until the record goes.
 func (w *fseventsWatcher) checkTopLater(dir string) {
+	if !w.checking.add(dir) {
+		return
+	}
 	time.AfterFunc(watchRetryInterval, func() {
+		w.checking.remove(dir)
 		if w.closed.Load() {
 			return
 		}
 		info, err := os.Stat(dir)
-		if err == nil && info.IsDir() && stillWorktree(w.root, dir) {
-			return
+		if err == nil && info.IsDir() {
+			if parser.IsLinkedWorktree(dir) {
+				return
+			}
+			if recordedWorktree(w.root, dir) {
+				w.checkTopLater(dir)
+				return
+			}
 		}
 		w.tops.remove(dir)
 		if err != nil || !info.IsDir() {

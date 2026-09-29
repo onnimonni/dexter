@@ -201,7 +201,25 @@ func TestFSEventsKeepsRecordedTop(t *testing.T) {
 	case <-time.After(20 * watchRetryInterval):
 	}
 	if !w.tops.has(wt) {
-		t.Error("a worktree that git still records is no longer a top")
+		t.Fatal("a worktree that git still records is no longer a top")
+	}
+
+	// Once git's record goes, as after git worktree prune, a later check
+	// indexes it.
+	if err := os.RemoveAll(filepath.Join(root, ".git", "worktrees", "wt")); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(wt, "lib", "copy.ex")
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case path := <-changes:
+			if path == want {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the directory was not indexed after its record went")
+		}
 	}
 }
 

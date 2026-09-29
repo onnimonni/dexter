@@ -122,11 +122,12 @@ func (s *worktreeTops) under(root, path string) bool {
 	return false
 }
 
-// stillWorktree reports whether dir, a known nested worktree top, still is one:
-// its .git file links a worktree, or git still records it, as it does while git
-// worktree remove deletes the checkout. The walkers skip both, so the watchers
-// must not index either. It reads git's records, so it is only for the rare
-// check of a top whose .git file went away.
-func stillWorktree(root, dir string) bool {
-	return parser.IsLinkedWorktree(dir) || slices.Contains(parser.NestedWorktreeTops(root), dir)
+// recordedWorktree reports whether git still records dir, a known nested
+// worktree top without a linked .git file, as a worktree of root's repository.
+// It does while git worktree remove deletes the checkout, and until git
+// worktree prune after the .git file alone is deleted. The walkers skip such a
+// directory, so the watchers must not index it either. It reads git's records,
+// so it is only for the rare check of a top whose .git file went away.
+func recordedWorktree(root, dir string) bool {
+	return slices.Contains(parser.NestedWorktreeTops(root), dir)
 }
