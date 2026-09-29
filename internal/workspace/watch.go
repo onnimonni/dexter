@@ -63,13 +63,6 @@ func ignoredWatchPath(root, path string) bool {
 	return false
 }
 
-// inNestedWorktree reports whether dir is, or lies inside, a linked git worktree
-// nested below root. The index leaves those trees out, so their directories need
-// no watch and creating one needs no reconcile.
-func inNestedWorktree(root, dir string) bool {
-	return dir != root && (parser.IsLinkedWorktree(dir) || parser.InLinkedWorktree(root, dir))
-}
-
 // worktreeTops is the set of nested worktree tops that a watcher knows. With it,
 // a watcher drops events from inside a worktree with map lookups only, and it
 // can find a top whose .git file went away.

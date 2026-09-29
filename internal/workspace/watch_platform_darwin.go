@@ -170,6 +170,13 @@ func (w *fseventsWatcher) gitFileChanged(dir string) {
 	}
 }
 
+// inNestedWorktree reports whether dir is, or lies inside, a linked git worktree
+// nested below root. The index leaves those trees out, so their directories need
+// no watch and creating one needs no reconcile.
+func inNestedWorktree(root, dir string) bool {
+	return dir != root && (parser.IsLinkedWorktree(dir) || parser.InLinkedWorktree(root, dir))
+}
+
 // checkTopLater indexes dir as a plain directory if, after the retry interval,
 // it still exists and is no longer a worktree.
 func (w *fseventsWatcher) checkTopLater(dir string) {
