@@ -90,6 +90,22 @@ func (s *worktreeTops) remove(dir string) {
 	delete(s.tops, dir)
 }
 
+// removeBelow forgets the tops strictly below dir, which went away or moved,
+// and returns them.
+func (s *worktreeTops) removeBelow(dir string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prefix := dir + string(filepath.Separator)
+	var removed []string
+	for top := range s.tops {
+		if strings.HasPrefix(top, prefix) {
+			delete(s.tops, top)
+			removed = append(removed, top)
+		}
+	}
+	return removed
+}
+
 func (s *worktreeTops) has(dir string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

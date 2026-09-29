@@ -174,6 +174,58 @@ func TestFSEventsKnowsRenamedTop(t *testing.T) {
 	}
 }
 
+// A known top can outlive its directory: git's record of a deleted worktree
+// is loaded at start, or the top's parent is moved away. A plain directory
+// made at that path later is indexed, not skipped for the watcher's life.
+func TestFSEventsForgetsStaleTops(t *testing.T) {
+	previous := watchRetryInterval
+	watchRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() { watchRetryInterval = previous })
+
+	root := t.TempDir()
+	changes := make(chan string, 64)
+	w := &fseventsWatcher{
+		root:      root,
+		eventRoot: root,
+		callbacks: WatchCallbacks{PathChanged: sendWithoutBlocking(changes), FullReconcile: func() {}},
+	}
+	stale := filepath.Join(root, ".claude", "worktrees", "deleted")
+	w.tops.add(stale)
+	file := filepath.Join(stale, "lib", "plain.ex")
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("defmodule Plain do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsevents.Event{Path: stale, Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
+	select {
+	case path := <-changes:
+		if path != file {
+			t.Fatalf("reported %s, want %s", path, file)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the plain directory at a stale top was not indexed")
+	}
+	if w.tops.has(stale) {
+		t.Error("a plain directory is still a known top")
+	}
+
+	parent := filepath.Join(root, "area")
+	inside := filepath.Join(parent, "wt")
+	w.tops.add(inside)
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(parent, filepath.Join(root, "area.old")); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsevents.Event{Path: parent, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	if w.tops.has(inside) {
+		t.Error("a top below a moved directory is still known")
+	}
+}
+
 // A top whose .git file goes away stays a top while git records it, as during
 // git worktree remove.
 func TestFSEventsKeepsRecordedTop(t *testing.T) {
@@ -184,11 +236,11 @@ func TestFSEventsKeepsRecordedTop(t *testing.T) {
 	root := t.TempDir()
 	wt := filepath.Join(root, "wt")
 	makeLinkedWorktree(t, root, wt)
-	changes := make(chan string, 8)
+	changes := make(chan string, 64)
 	w := &fseventsWatcher{
 		root:      root,
 		eventRoot: root,
-		callbacks: WatchCallbacks{PathChanged: func(path string) { changes <- path }, FullReconcile: func() {}},
+		callbacks: WatchCallbacks{PathChanged: sendWithoutBlocking(changes), FullReconcile: func() {}},
 	}
 	w.tops.add(wt)
 	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
@@ -235,11 +287,11 @@ func TestFSEventsIndexesTopThatBecomesPlain(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(root, ".git", "worktrees", "wt")); err != nil {
 		t.Fatal(err)
 	}
-	changes := make(chan string, 8)
+	changes := make(chan string, 64)
 	w := &fseventsWatcher{
 		root:      root,
 		eventRoot: root,
-		callbacks: WatchCallbacks{PathChanged: func(path string) { changes <- path }, FullReconcile: func() {}},
+		callbacks: WatchCallbacks{PathChanged: sendWithoutBlocking(changes), FullReconcile: func() {}},
 	}
 	w.tops.add(wt)
 	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
@@ -359,6 +411,17 @@ func TestFSEventsWorktreeLifecycle(t *testing.T) {
 	for _, path := range paths {
 		if strings.HasPrefix(path, prefix) && parser.IsElixirFile(path) {
 			t.Errorf("reported %s from the nested worktree", path)
+		}
+	}
+}
+
+// sendWithoutBlocking is a PathChanged callback that never blocks the timer
+// goroutine that calls it, even after the test stops reading.
+func sendWithoutBlocking(changes chan<- string) func(string) {
+	return func(path string) {
+		select {
+		case changes <- path:
+		default:
 		}
 	}
 }

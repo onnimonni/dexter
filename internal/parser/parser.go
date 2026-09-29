@@ -462,7 +462,7 @@ func CollectElixirFilesParallel(root string) []string {
 			path := filepath.Join(dir, name)
 
 			// IsDir() is false for a symlink to a directory, so symlinked trees
-			// are not descended into — the same behaviour as filepath.WalkDir.
+			// are not descended into, as in WalkElixirFiles.
 			if e.IsDir() {
 				if skipDir(name) {
 					continue
